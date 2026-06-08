@@ -538,19 +538,21 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             local_model.load_state_dict(local_weights_list[idx], strict=True)
             local_model_list[idx] = local_model
 
-        global_high_protos = proto_aggregation(local_high_protos)
-        global_low_protos = proto_aggregation(local_low_protos)
+        # Log telemetry and get sync decisions / cached local prototypes
+        cached_high_protos, cached_low_protos, sync_decisions = telemetry_controller.log_round(
+            round, local_high_protos, local_low_protos, global_high_protos, global_low_protos, global_logits
+        )
+
+        global_high_protos = proto_aggregation(cached_high_protos)
+        global_low_protos = proto_aggregation(cached_low_protos)
 
         # global model training:
-        # create inputs: local high-level prototypes
-        global_data, global_label = get_global_input(local_high_protos)
+        # create inputs: local high-level prototypes (using cached local prototypes)
+        global_data, global_label = get_global_input(cached_high_protos)
         dataset = TensorDataset(global_data, global_label)
         train_dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
         # begin training and output global logits
         global_logits = train_global_proto_model(global_model, train_dataloader)
-
-        # Log telemetry for this round
-        telemetry_controller.log_round(round, local_high_protos, local_low_protos, global_high_protos, global_low_protos, global_logits)
 
         # test
         acc_list_l, loss_list_l, acc_list_g, loss_list, loss_total_list = test_inference_new_het_lt(args,local_model_list,test_dataset,classes_list,user_groups_lt,global_high_protos)

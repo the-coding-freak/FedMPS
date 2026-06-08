@@ -88,5 +88,17 @@ def args_parser():
     parser.add_argument('--ntd_tau', type=float, default=1, help='for fedntd, the temperature of distilling')
     parser.add_argument('--ntd_beta', type=float, default=1, help='for fedntd, the wight of ntdloss')
 
+    # Week 3 selective synchronization arguments
+    parser.add_argument('--sync_threshold_type', type=str, default='fixed', choices=['fixed', 'adaptive'],
+                        help="fixed or adaptive threshold")
+    parser.add_argument('--sync_threshold', type=float, default=0.01,
+                        help="threshold value for fixed sync gating")
+    parser.add_argument('--sync_gamma', type=float, default=0.5,
+                        help="gamma factor for adaptive MAD thresholding")
+    parser.add_argument('--sync_staleness_K', type=int, default=10,
+                        help="maximum allowed prototype staleness rounds (K)")
+    parser.add_argument('--sync_rho', type=float, default=0.0,
+                        help="staleness weight factor in sync score")
+
     args = parser.parse_args()
     return args
