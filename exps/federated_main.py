@@ -11,6 +11,9 @@ import datetime
 import logging
 
 
+root_dir = (Path(__file__).parent / "..").resolve()
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
 lib_dir = (Path(__file__).parent / ".." / "lib").resolve()
 if str(lib_dir) not in sys.path:
     sys.path.insert(0, str(lib_dir))
@@ -22,6 +25,7 @@ from lib.options import *
 from lib.update import *
 from lib.models.models import *
 from lib.utils import *
+from lib.sync_controller import TelemetryController
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
@@ -487,7 +491,10 @@ def FedProto_taskheter(args, train_dataset, test_dataset, user_groups, user_grou
     logger.info('| BEST ROUND: {} | For all users , mean of test acc is {:.5f}, std of test acc is {:.5f}'.format(best_round_w ,best_acc_w ,best_std_w ))
 
 
-def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local_model_list, classes_list,summary_writer,logger):
+def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local_model_list, classes_list,summary_writer,logger, logdir):
+
+    # Initialize telemetry controller
+    telemetry_controller = TelemetryController(args, logdir, classes_list)
 
     # global model: shares the same structure as the output layer of each local model
     global_model = GlobalFedmps(args)
@@ -542,6 +549,9 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
         # begin training and output global logits
         global_logits = train_global_proto_model(global_model, train_dataloader)
 
+        # Log telemetry for this round
+        telemetry_controller.log_round(round, local_high_protos, local_low_protos, global_high_protos, global_low_protos, global_logits)
+
         # test
         acc_list_l, loss_list_l, acc_list_g, loss_list, loss_total_list = test_inference_new_het_lt(args,local_model_list,test_dataset,classes_list,user_groups_lt,global_high_protos)
 
@@ -571,6 +581,9 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
     print('| BEST ROUND: {} | For all users , mean of test acc is {:.5f}, std of test acc is {:.5f}'.format(best_round_w, best_acc_w, best_std_w))
     logger.info('best w results:')
     logger.info('| BEST ROUND: {} | For all users , mean of test acc is {:.5f}, std of test acc is {:.5f}'.format(best_round_w, best_acc_w, best_std_w))
+
+    # Save telemetry logs and plots
+    telemetry_controller.save_logs()
 
 
 
@@ -711,7 +724,7 @@ if __name__ == '__main__':
     elif args.alg=='fedproto':
         FedProto_taskheter(args, train_dataset, test_dataset, user_groups, user_groups_lt, local_model_list, classes_list, summary_writer,logger,logdir)
     elif args.alg=='ours':#FedMPS
-        FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local_model_list, classes_list,summary_writer,logger)
+        FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local_model_list, classes_list,summary_writer,logger,logdir)
 
 
 
