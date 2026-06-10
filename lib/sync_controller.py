@@ -19,6 +19,21 @@ class TelemetryController:
         self.sync_staleness_K = getattr(args, 'sync_staleness_K', 10)
         self.sync_rho = getattr(args, 'sync_rho', 0.0)
         
+        # Week 4 QoS and MEC parameters
+        self.sync_trace_file = getattr(args, 'sync_trace_file', None)
+        self.sync_qos_lambda = getattr(args, 'sync_qos_lambda', 1.0)
+        self.sync_qos_mu = getattr(args, 'sync_qos_mu', 1.0)
+        self.sync_mec_aggregation = getattr(args, 'sync_mec_aggregation', 0)
+        
+        # Load network trace file
+        if self.sync_trace_file is not None and os.path.exists(self.sync_trace_file):
+            self.trace_df = pd.read_csv(self.sync_trace_file)
+            print(f"Loaded network trace from {self.sync_trace_file}")
+        else:
+            self.trace_df = None
+            if self.sync_trace_file is not None:
+                print(f"Warning: Network trace file {self.sync_trace_file} not found. Using ideal network mode.")
+        
         # State tracking
         self.prev_local_high_protos = {}  # {client_id: {class_id: tensor}} (fresh local from prev round)
         self.prev_local_low_protos = {}   # {client_id: {class_id: tensor}}
@@ -76,10 +91,6 @@ class TelemetryController:
                     d_low = 1.0 - cos_low
                 
                 d_combined = alpha * d_high + beta * d_low
-                
-                # Priority Score = D_{i,c,t} + \rho * (r_{i,c,t} / K)
-                score = d_combined + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)
-                scores[(idx, c_int)] = score
                 drift_data[(idx, c_int)] = (d_high, d_low, d_combined)
                 
                 # Update previous prototypes state (always freshly trained)
@@ -88,6 +99,87 @@ class TelemetryController:
                     self.prev_local_low_protos[idx] = {}
                 self.prev_local_high_protos[idx][c_int] = h_proto_cpu
                 self.prev_local_low_protos[idx][c_int] = l_proto_cpu
+                
+        # 2. QoS Cost calculation and Score scaling
+        client_to_mec = {idx: 0 for idx in range(self.num_users)}
+        has_qos_data = False
+        if self.trace_df is not None:
+            round_rows = self.trace_df[self.trace_df['round'] == round_idx]
+            if not round_rows.empty:
+                qos_by_client = {}
+                for _, row in round_rows.iterrows():
+                    cid = int(row['client_id'])
+                    qos_by_client[cid] = {
+                        'mec_id': int(row.get('mec_id', 0)),
+                        'uplink_mbps': float(row.get('uplink_mbps', 100.0)),
+                        'latency_ms': float(row.get('latency_ms', 0.0)),
+                        'packet_loss': float(row.get('packet_loss', 0.0))
+                    }
+                has_qos_data = True
+                
+        client_qos_raw = {}
+        client_class_pairs = []
+        for idx in range(self.num_users):
+            for c in self.classes_list[idx]:
+                client_class_pairs.append((idx, int(c)))
+                
+        for idx in range(self.num_users):
+            if has_qos_data and idx in qos_by_client:
+                mec_id = qos_by_client[idx]['mec_id']
+                uplink_mbps = max(qos_by_client[idx]['uplink_mbps'], 1e-3)
+                latency_ms = qos_by_client[idx]['latency_ms']
+                packet_loss = qos_by_client[idx]['packet_loss']
+            else:
+                mec_id = 0
+                uplink_mbps = 100.0
+                latency_ms = 0.0
+                packet_loss = 0.0
+                
+            client_to_mec[idx] = mec_id
+            
+            # Compute transmission delay dynamically
+            c_first = int(self.classes_list[idx][0])
+            h_proto = local_high_protos[idx][c_first]
+            l_proto = local_low_protos[idx][c_first]
+            proto_megabits = (h_proto.numel() + l_proto.numel()) * 32 / 1000000.0
+            delay_sec = proto_megabits / uplink_mbps
+            
+            client_qos_raw[idx] = {
+                'delay': delay_sec,
+                'latency': latency_ms,
+                'loss': packet_loss
+            }
+            
+        # Min-Max Normalization across clients in the round
+        delays_arr = np.array([client_qos_raw[idx]['delay'] for idx, _ in client_class_pairs])
+        latencies_arr = np.array([client_qos_raw[idx]['latency'] for idx, _ in client_class_pairs])
+        losses_arr = np.array([client_qos_raw[idx]['loss'] for idx, _ in client_class_pairs])
+        
+        def min_max_scale(arr):
+            amin = arr.min()
+            amax = arr.max()
+            diff = amax - amin
+            if diff < 1e-8:
+                return np.zeros_like(arr)
+            return (arr - amin) / diff
+            
+        norm_delays = min_max_scale(delays_arr)
+        norm_latencies = min_max_scale(latencies_arr)
+        norm_losses = min_max_scale(losses_arr)
+        
+        qos_costs = {}
+        for pair_idx, (idx, c_int) in enumerate(client_class_pairs):
+            c_cost = norm_delays[pair_idx] + self.sync_qos_lambda * norm_latencies[pair_idx] + self.sync_qos_mu * norm_losses[pair_idx]
+            qos_costs[(idx, c_int)] = c_cost
+            
+        # Calculate Priority Scores
+        for idx, c_int in client_class_pairs:
+            d_high, d_low, d_combined = drift_data[(idx, c_int)]
+            if self.trace_df is not None:
+                score = (d_combined + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)) / (1.0 + qos_costs[(idx, c_int)])
+            else:
+                score = d_combined + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)
+            scores[(idx, c_int)] = score
         
         # Determine the gating threshold tau_t
         if self.sync_threshold_type == 'fixed':
@@ -135,7 +227,8 @@ class TelemetryController:
                     'drift_combined': float(d_combined),
                     'staleness': int(staleness),
                     'synced': bool(is_sync),
-                    'score': float(score)
+                    'score': float(score),
+                    'qos_cost': float(qos_costs[(idx, c_int)])
                 })
                 
                 # Update cache and staleness
@@ -146,7 +239,7 @@ class TelemetryController:
                 else:
                     self.r_staleness[idx][c_int] += 1
                     
-        # 2. Byte count calculations based on sync decisions
+        # 3. Byte count calculations based on sync decisions
         total_uplink_bytes = 0
         total_downlink_bytes = 0
         
@@ -170,20 +263,51 @@ class TelemetryController:
                         g_logit_bytes = global_logits[c_int].numel() * 4
                         total_downlink_bytes += g_logit_bytes
             
+        # 4. Compute MEC-to-cloud backhaul bytes
+        total_mec_to_cloud_bytes = 0
+        if self.sync_mec_aggregation == 1:
+            mec_classes = {}
+            for idx in range(self.num_users):
+                mec_id = client_to_mec[idx]
+                if mec_id not in mec_classes:
+                    mec_classes[mec_id] = set()
+                for c in self.classes_list[idx]:
+                    c_int = int(c)
+                    if sync_decisions[idx][c_int]:
+                        mec_classes[mec_id].add(c_int)
+                        
+            for mec_id, classes_set in mec_classes.items():
+                for c_int in classes_set:
+                    # Find a client under this MEC that synced this class to get its size
+                    sample_client = None
+                    for idx in range(self.num_users):
+                        if client_to_mec[idx] == mec_id and c_int in self.classes_list[idx] and sync_decisions[idx][c_int]:
+                            sample_client = idx
+                            break
+                    if sample_client is not None:
+                        h_proto = local_high_protos[sample_client][c_int]
+                        l_proto = local_low_protos[sample_client][c_int]
+                        h_bytes = h_proto.numel() * 4
+                        l_bytes = l_proto.numel() * 4
+                        total_mec_to_cloud_bytes += (h_bytes + l_bytes)
+        else:
+            total_mec_to_cloud_bytes = total_uplink_bytes
+
         # Save prototypes for this round
         torch.save(saved_protos, os.path.join(proto_save_dir, f'round_{round_idx}.pt'))
         
-        # Record bytes and skipped percentage
+        # Record bytes, skipped percentage and MEC-to-cloud backhaul bytes
         skipped_pct = (num_skipped / total_pairs) * 100.0 if total_pairs > 0 else 0.0
         self.byte_records.append({
             'round': round_idx,
             'uplink_bytes': total_uplink_bytes,
             'downlink_bytes': total_downlink_bytes,
             'total_bytes': total_uplink_bytes + total_downlink_bytes,
-            'skipped_percentage': skipped_pct
+            'skipped_percentage': skipped_pct,
+            'mec_to_cloud_bytes': total_mec_to_cloud_bytes
         })
         
-        return self.cached_local_high_protos, self.cached_local_low_protos, sync_decisions
+        return self.cached_local_high_protos, self.cached_local_low_protos, sync_decisions, client_to_mec
         
     def save_logs(self):
         # Save CSVs

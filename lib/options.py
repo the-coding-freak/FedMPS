@@ -100,5 +100,15 @@ def args_parser():
     parser.add_argument('--sync_rho', type=float, default=0.0,
                         help="staleness weight factor in sync score")
 
+    # Week 4 QoS and MEC Layer arguments
+    parser.add_argument('--sync_trace_file', type=str, default=None,
+                        help="path to 5G network trace CSV file")
+    parser.add_argument('--sync_qos_lambda', type=float, default=1.0,
+                        help="weight of latency in QoS cost function")
+    parser.add_argument('--sync_qos_mu', type=float, default=1.0,
+                        help="weight of packet loss in QoS cost function")
+    parser.add_argument('--sync_mec_aggregation', type=int, default=0, choices=[0, 1],
+                        help="enable MEC-level regional aggregation (1) or use cloud-only aggregation (0)")
+
     args = parser.parse_args()
     return args

@@ -539,12 +539,45 @@ def FedMPS(args, train_dataset, test_dataset, user_groups, user_groups_lt, local
             local_model_list[idx] = local_model
 
         # Log telemetry and get sync decisions / cached local prototypes
-        cached_high_protos, cached_low_protos, sync_decisions = telemetry_controller.log_round(
+        cached_high_protos, cached_low_protos, sync_decisions, client_to_mec = telemetry_controller.log_round(
             round, local_high_protos, local_low_protos, global_high_protos, global_low_protos, global_logits
         )
 
-        global_high_protos = proto_aggregation(cached_high_protos)
-        global_low_protos = proto_aggregation(cached_low_protos)
+        if getattr(args, 'sync_mec_aggregation', 0) == 1:
+            # Group UEs by their MEC node
+            mec_high_protos = {}
+            mec_low_protos = {}
+            for idx, mec_id in client_to_mec.items():
+                if mec_id not in mec_high_protos:
+                    mec_high_protos[mec_id] = {}
+                    mec_low_protos[mec_id] = {}
+                mec_high_protos[mec_id][idx] = cached_high_protos[idx]
+                mec_low_protos[mec_id][idx] = cached_low_protos[idx]
+                
+            # Perform regional aggregation at each MEC node
+            mec_aggregated_high = {}
+            mec_aggregated_low = {}
+            for mec_id in mec_high_protos.keys():
+                mec_aggregated_high[mec_id] = proto_aggregation(mec_high_protos[mec_id])
+                mec_aggregated_low[mec_id] = proto_aggregation(mec_low_protos[mec_id])
+                
+            # Convert MEC aggregated prototypes from list format back to raw tensors for cloud aggregation
+            mec_aggregated_high_tensors = {}
+            mec_aggregated_low_tensors = {}
+            for mec_id in mec_aggregated_high.keys():
+                mec_aggregated_high_tensors[mec_id] = {}
+                mec_aggregated_low_tensors[mec_id] = {}
+                for c in mec_aggregated_high[mec_id].keys():
+                    mec_aggregated_high_tensors[mec_id][c] = mec_aggregated_high[mec_id][c][0]
+                    mec_aggregated_low_tensors[mec_id][c] = mec_aggregated_low[mec_id][c][0]
+                    
+            # Cloud aggregation over MEC regional prototypes
+            global_high_protos = proto_aggregation(mec_aggregated_high_tensors)
+            global_low_protos = proto_aggregation(mec_aggregated_low_tensors)
+        else:
+            # Cloud only aggregation (direct)
+            global_high_protos = proto_aggregation(cached_high_protos)
+            global_low_protos = proto_aggregation(cached_low_protos)
 
         # global model training:
         # create inputs: local high-level prototypes (using cached local prototypes)
