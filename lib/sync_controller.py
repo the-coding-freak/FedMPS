@@ -24,6 +24,7 @@ class TelemetryController:
         self.sync_qos_lambda = getattr(args, 'sync_qos_lambda', 1.0)
         self.sync_qos_mu = getattr(args, 'sync_qos_mu', 1.0)
         self.sync_mec_aggregation = getattr(args, 'sync_mec_aggregation', 0)
+        self.sync_qos_only = getattr(args, 'sync_qos_only', 0)
         
         # Load network trace file
         if self.sync_trace_file is not None and os.path.exists(self.sync_trace_file):
@@ -175,10 +176,11 @@ class TelemetryController:
         # Calculate Priority Scores
         for idx, c_int in client_class_pairs:
             d_high, d_low, d_combined = drift_data[(idx, c_int)]
+            d_combined_score = 0.0 if self.sync_qos_only == 1 else d_combined
             if self.trace_df is not None:
-                score = (d_combined + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)) / (1.0 + qos_costs[(idx, c_int)])
+                score = (d_combined_score + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)) / (1.0 + qos_costs[(idx, c_int)])
             else:
-                score = d_combined + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)
+                score = d_combined_score + self.sync_rho * (self.r_staleness[idx][c_int] / self.sync_staleness_K)
             scores[(idx, c_int)] = score
         
         # Determine the gating threshold tau_t

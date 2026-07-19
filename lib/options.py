@@ -109,6 +109,8 @@ def args_parser():
                         help="weight of packet loss in QoS cost function")
     parser.add_argument('--sync_mec_aggregation', type=int, default=0, choices=[0, 1],
                         help="enable MEC-level regional aggregation (1) or use cloud-only aggregation (0)")
+    parser.add_argument('--sync_qos_only', type=int, default=0, choices=[0, 1],
+                        help="disable semantic drift and gate prototypes based purely on QoS network cost and staleness")
 
     args = parser.parse_args()
     return args
