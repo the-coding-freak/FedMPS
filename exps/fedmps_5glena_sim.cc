@@ -25,9 +25,19 @@ struct TelemetryRecord {
     double uplink_mbps;
     double latency_ms;
     double packet_loss;
+    uint32_t handover; // 1 if handover occurred this round, 0 otherwise
 };
 
 std::vector<TelemetryRecord> g_telemetry_records;
+uint32_t g_total_handovers = 0;
+
+// Global tracking maps for per-round FlowMonitor deltas
+std::map<FlowId, uint64_t> g_lastTxPackets;
+std::map<FlowId, uint64_t> g_lastRxPackets;
+std::map<FlowId, uint64_t> g_lastRxBytes;
+std::map<FlowId, uint64_t> g_lastLostPackets;
+std::map<FlowId, double> g_lastDelaySum;
+std::map<uint32_t, uint32_t> g_lastMecId; // Tracks last serving MEC cell per client
 
 // Periodic callback to collect telemetry for the current round
 void CollectTelemetry (uint32_t round, 
@@ -53,26 +63,44 @@ void CollectTelemetry (uint32_t round,
             uint8_t ip_octet = t.sourceAddress.Get () & 0xFF;
             uint32_t client_id = ip_octet - 2; // Assuming UE IPs start at 10.0.0.2 / 7.0.0.2
 
-            double txPackets = i->second.txPackets;
-            double rxPackets = i->second.rxPackets;
-            double lostPackets = i->second.lostPackets;
-            
+            FlowId fid = i->first;
+
+            uint64_t current_txPackets = i->second.txPackets;
+            uint64_t current_rxPackets = i->second.rxPackets;
+            uint64_t current_rxBytes = i->second.rxBytes;
+            uint64_t current_lostPackets = i->second.lostPackets;
+            double current_delaySum = i->second.delaySum.GetSeconds ();
+
+            // Calculate per-round deltas
+            uint64_t delta_txPackets = current_txPackets - g_lastTxPackets[fid];
+            uint64_t delta_rxPackets = current_rxPackets - g_lastRxPackets[fid];
+            uint64_t delta_rxBytes = current_rxBytes - g_lastRxBytes[fid];
+            uint64_t delta_lostPackets = current_lostPackets - g_lastLostPackets[fid];
+            double delta_delaySum = current_delaySum - g_lastDelaySum[fid];
+
+            // Save state for next round
+            g_lastTxPackets[fid] = current_txPackets;
+            g_lastRxPackets[fid] = current_rxPackets;
+            g_lastRxBytes[fid] = current_rxBytes;
+            g_lastLostPackets[fid] = current_lostPackets;
+            g_lastDelaySum[fid] = current_delaySum;
+
             double packet_loss = 0.0;
-            if (txPackets > 0)
+            if (delta_txPackets > 0)
             {
-                packet_loss = lostPackets / txPackets;
+                packet_loss = (double)delta_lostPackets / (double)delta_txPackets;
             }
 
             double latency_ms = 0.0;
-            if (rxPackets > 0)
+            if (delta_rxPackets > 0)
             {
-                latency_ms = (i->second.delaySum.GetSeconds () / rxPackets) * 1000.0;
+                latency_ms = (delta_delaySum / (double)delta_rxPackets) * 1000.0;
             }
 
             double throughput_mbps = 0.0;
             if (round_duration > 0)
             {
-                throughput_mbps = (i->second.rxBytes * 8.0) / (round_duration * 1e6);
+                throughput_mbps = (delta_rxBytes * 8.0) / (round_duration * 1e6);
             }
 
             // Query UE's serving 5G NR cell (MEC ID)
@@ -87,6 +115,21 @@ void CollectTelemetry (uint32_t round,
                 }
             }
 
+            // Check if cell handover occurred since last round
+            uint32_t handover = 0;
+            if (round > 0 && g_lastMecId.find(client_id) != g_lastMecId.end())
+            {
+                if (mec_id != 0 && mec_id != g_lastMecId[client_id] && g_lastMecId[client_id] != 0)
+                {
+                    handover = 1;
+                    g_total_handovers++;
+                }
+            }
+            if (mec_id != 0)
+            {
+                g_lastMecId[client_id] = mec_id;
+            }
+
             TelemetryRecord record;
             record.round = round;
             record.client_id = client_id;
@@ -94,6 +137,7 @@ void CollectTelemetry (uint32_t round,
             record.uplink_mbps = throughput_mbps;
             record.latency_ms = latency_ms;
             record.packet_loss = packet_loss;
+            record.handover = handover;
 
             g_telemetry_records.push_back (record);
         }
@@ -141,6 +185,15 @@ int main (int argc, char *argv[])
 
     allBwps = CcBwpCreator::GetAllBwps ({band});
 
+    // Set Antennas & Handover Algorithm BEFORE NetDevice Installation (gNB: 8x8 MIMO array, UE: 2x2 array)
+    nrHelper->SetGnbAntennaAttribute ("NumRows", UintegerValue (8));
+    nrHelper->SetGnbAntennaAttribute ("NumColumns", UintegerValue (8));
+    nrHelper->SetUeAntennaAttribute ("NumRows", UintegerValue (2));
+    nrHelper->SetUeAntennaAttribute ("NumColumns", UintegerValue (2));
+    nrHelper->SetHandoverAlgorithmType ("ns3::NrA2A4RsrpHandoverAlgorithm");
+    nrHelper->SetHandoverAlgorithmAttribute ("ServingCellThreshold", UintegerValue (46));
+    nrHelper->SetHandoverAlgorithmAttribute ("NeighbourCellOffset", UintegerValue (1));
+
     Ptr<Node> pgw = epcHelper->GetPgwNode ();
 
     // Create Remote Host (Cloud Orchestrator)
@@ -186,18 +239,16 @@ int main (int argc, char *argv[])
                                "Distance", DoubleValue (20.0));
     mobility.Install (ueNodes);
 
-    // Install 5G NR NetDevices
+    // Install 5G NR NetDevices with pre-configured antenna attributes
     NetDeviceContainer gNbDevices = nrHelper->InstallGnbDevice (gNbNodes, allBwps);
     NetDeviceContainer ueDevices = nrHelper->InstallUeDevice (ueNodes, allBwps);
 
-    // Set Antennas (gNB: 8x8 MIMO array, UE: 2x2 array)
-    nrHelper->SetGnbAntennaAttribute ("NumRows", UintegerValue (8));
-    nrHelper->SetGnbAntennaAttribute ("NumColumns", UintegerValue (8));
-    nrHelper->SetUeAntennaAttribute ("NumRows", UintegerValue (2));
-    nrHelper->SetUeAntennaAttribute ("NumColumns", UintegerValue (2));
-
+    internet.Install (gNbNodes);
     internet.Install (ueNodes);
     Ipv4InterfaceContainer ueIpIfaces = epcHelper->AssignUeIpv4Address (NetDeviceContainer (ueDevices));
+
+    // Enable X2 interface between MEC gNBs
+    nrHelper->AddX2Interface (gNbNodes);
 
     // Attach UEs to gNBs
     for (uint32_t u = 0; u < ueDevices.GetN (); ++u)
@@ -230,8 +281,8 @@ int main (int argc, char *argv[])
         clientHelper.SetAttribute ("PacketSize", UintegerValue (1024));
 
         ApplicationContainer clientApps = clientHelper.Install (ueNodes.Get (u));
-        clientApps.Start (Seconds (0.5));
-        clientApps.Stop (Seconds (rounds * round_duration));
+        clientApps.Start (Seconds (0.01));
+        clientApps.Stop (Seconds ((rounds + 1) * round_duration));
     }
 
     FlowMonitorHelper flowmonHelper;
@@ -240,7 +291,7 @@ int main (int argc, char *argv[])
 
     for (uint32_t r = 0; r < rounds; ++r)
     {
-        double scheduled_time = (r + 1) * round_duration - 0.1;
+        double scheduled_time = (r + 1) * round_duration;
         Simulator::Schedule (Seconds (scheduled_time), 
                              &CollectTelemetry, 
                              r, 
@@ -251,12 +302,12 @@ int main (int argc, char *argv[])
     }
 
     NS_LOG_UNCOND ("Starting 5G-LENA Simulation for " << rounds << " rounds...");
-    Simulator::Stop (Seconds (rounds * round_duration));
+    Simulator::Stop (Seconds ((rounds + 1) * round_duration));
     Simulator::Run ();
 
     std::ofstream csv;
     csv.open (output_file.c_str (), std::ios::out);
-    csv << "round,client_id,mec_id,uplink_mbps,latency_ms,packet_loss\n";
+    csv << "round,client_id,mec_id,uplink_mbps,latency_ms,packet_loss,handover\n";
     for (size_t i = 0; i < g_telemetry_records.size (); ++i)
     {
         csv << g_telemetry_records[i].round << ","
@@ -264,10 +315,12 @@ int main (int argc, char *argv[])
             << g_telemetry_records[i].mec_id << ","
             << g_telemetry_records[i].uplink_mbps << ","
             << g_telemetry_records[i].latency_ms << ","
-            << g_telemetry_records[i].packet_loss << "\n";
+            << g_telemetry_records[i].packet_loss << ","
+            << g_telemetry_records[i].handover << "\n";
     }
     csv.close ();
     NS_LOG_UNCOND ("Successfully wrote " << g_telemetry_records.size() << " 5G-LENA network telemetry rows to " << output_file);
+    NS_LOG_UNCOND ("Total 5G-NR Handovers Observed: " << g_total_handovers);
 
     Simulator::Destroy ();
     return 0;
