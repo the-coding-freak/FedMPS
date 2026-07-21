@@ -145,6 +145,7 @@ void CollectTelemetry (uint32_t round,
 
     monitor->SerializeToXmlFile ("temp_5glena_stats.xml", true, true);
     NS_LOG_UNCOND ("Round " << round << ": Collected " << g_telemetry_records.size() << " total 5G-LENA telemetry rows so far.");
+    std::cout << std::flush;
 }
 
 int main (int argc, char *argv[])
@@ -161,10 +162,20 @@ int main (int argc, char *argv[])
     cmd.AddValue ("output", "Path to save output trace CSV", output_file);
     cmd.Parse (argc, argv);
 
+    NS_LOG_UNCOND ("Starting 5G-LENA Simulation for " << rounds << " rounds...");
+    std::cout << std::flush;
+
+    // Disable SpectrumPhy assertion error model during handovers
+    Config::SetDefault ("ns3::NrSpectrumPhy::DataErrorModelEnabled", BooleanValue (false));
+
     // Create EPC Helper for 5G NR Core
     Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper> ();
     Ptr<NrHelper> nrHelper = CreateObject<NrHelper> ();
     nrHelper->SetEpcHelper (epcHelper);
+
+    // Disable SRS in UL and F slots to avoid PHY state conflicts during beamforming & handovers
+    nrHelper->SetSchedulerAttribute ("EnableSrsInUlSlots", BooleanValue (false));
+    nrHelper->SetSchedulerAttribute ("EnableSrsInFSlots", BooleanValue (false));
 
     // 5G NR Spectrum & Beamforming setup (3.5 GHz Sub-6 band, 100 MHz Channel)
     BandwidthPartInfoPtrVector allBwps;
@@ -243,6 +254,12 @@ int main (int argc, char *argv[])
     NetDeviceContainer gNbDevices = nrHelper->InstallGnbDevice (gNbNodes, allBwps);
     NetDeviceContainer ueDevices = nrHelper->InstallUeDevice (ueNodes, allBwps);
 
+    // Set 5G NR Pattern to Flexible (F) slots for all slots to allow smooth duplex scheduling during handovers
+    for (uint32_t i = 0; i < gNbDevices.GetN (); ++i)
+    {
+        nrHelper->GetGnbPhy (gNbDevices.Get (i), 0)->SetAttribute ("Pattern", StringValue ("F|F|F|F|F|F|F|F|F|F|"));
+    }
+
     internet.Install (gNbNodes);
     internet.Install (ueNodes);
     Ipv4InterfaceContainer ueIpIfaces = epcHelper->AssignUeIpv4Address (NetDeviceContainer (ueDevices));
@@ -274,15 +291,14 @@ int main (int argc, char *argv[])
 
     for (uint32_t u = 0; u < ueNodes.GetN (); ++u)
     {
-        OnOffHelper clientHelper ("ns3::UdpSocketFactory", Address (InetSocketAddress (internetIpIfaces.GetAddress (1), dlPort)));
-        clientHelper.SetAttribute ("OnTime", StringValue ("ns3::ConstantRandomVariable[Constant=1.0]"));
-        clientHelper.SetAttribute ("OffTime", StringValue ("ns3::ConstantRandomVariable[Constant=0.0]"));
-        clientHelper.SetAttribute ("DataRate", DataRateValue (DataRate ("2Mbps")));
+        UdpClientHelper clientHelper (internetIpIfaces.GetAddress (1), dlPort);
+        clientHelper.SetAttribute ("MaxPackets", UintegerValue (0xFFFFFFFF));
+        clientHelper.SetAttribute ("Interval", TimeValue (MilliSeconds (20)));
         clientHelper.SetAttribute ("PacketSize", UintegerValue (1024));
 
         ApplicationContainer clientApps = clientHelper.Install (ueNodes.Get (u));
-        clientApps.Start (Seconds (0.01));
-        clientApps.Stop (Seconds ((rounds + 1) * round_duration));
+        clientApps.Start (Seconds (0.1 + u * 0.005));
+        clientApps.Stop (Seconds ((rounds + 2) * round_duration));
     }
 
     FlowMonitorHelper flowmonHelper;
