@@ -27,13 +27,26 @@ class TelemetryController:
         self.sync_qos_only = getattr(args, 'sync_qos_only', 0)
         
         # Load network trace file
-        if self.sync_trace_file is not None and os.path.exists(self.sync_trace_file):
-            self.trace_df = pd.read_csv(self.sync_trace_file)
-            print(f"Loaded network trace from {self.sync_trace_file}")
+        if self.sync_trace_file is not None:
+            possible_paths = [
+                self.sync_trace_file,
+                os.path.join(os.path.dirname(__file__), '..', self.sync_trace_file),
+                os.path.join(os.path.dirname(__file__), '..', 'exps', os.path.basename(self.sync_trace_file))
+            ]
+            trace_path = None
+            for p in possible_paths:
+                if os.path.exists(p):
+                    trace_path = p
+                    break
+                    
+            if trace_path is not None:
+                self.trace_df = pd.read_csv(trace_path)
+                print(f"Loaded network trace from {trace_path}")
+            else:
+                self.trace_df = None
+                print(f"Warning: Network trace file {self.sync_trace_file} not found. Using ideal network mode.")
         else:
             self.trace_df = None
-            if self.sync_trace_file is not None:
-                print(f"Warning: Network trace file {self.sync_trace_file} not found. Using ideal network mode.")
         
         # State tracking
         self.prev_local_high_protos = {}  # {client_id: {class_id: tensor}} (fresh local from prev round)
