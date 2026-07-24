@@ -1,0 +1,2 @@
+# Dependencies for Kaggle/Colab environments
+tensorboardX>=2.6.0
